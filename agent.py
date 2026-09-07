@@ -119,23 +119,33 @@ class Agent:
         deterministic: bool = True,
         max_steps: int = 1000,
         frame_stride: int = 3,
+        env_kwargs: dict | None = None,
     ) -> dict:
         """
         Joue un épisode complet et renvoie :
         - la récompense totale et le nombre de pas
-        - la liste des actions jouées (pour le dashboard "décisions par circonstance")
+        - la liste des actions jouées
         - un sous-échantillon de frames RGB pour l'animation du GUI
+        - un historique pas-à-pas (step_records) : phase, action (label +
+          composantes séparées), récompense ET observation complète à
+          chaque pas, pour visualiser les réactions du modèle dans le temps
+          (dashboard "actions vs observations")
 
         frame_stride > 1 réduit le nombre de frames conservées (donc la RAM
         utilisée) sans casser la fluidité perçue de l'animation.
+
+        env_kwargs : paramètres physiques de LunarLander (gravity, enable_wind,
+        wind_power, turbulence_power) transmis tels quels à gym.make(). None
+        ou {} = valeurs par défaut de l'environnement.
         """
-        env = gym.make(self.env_name, render_mode="rgb_array")
+        env = gym.make(self.env_name, render_mode="rgb_array", **(env_kwargs or {}))
         obs, info = env.reset()
 
         total_reward = 0.0
         actions_taken = []
         frames = []
-        step_records = []  # petit historique (état résumé, action) pour le dashboard "décisions"
+        frame_step_indices = []  # frames[i] correspond à step_records[frame_step_indices[i]]
+        step_records = []  # historique pas-à-pas : observation + action + récompense, dans le temps
 
         for step in range(max_steps):
             action = self.predict_action(obs.tolist(), deterministic=deterministic)
@@ -146,6 +156,7 @@ class Agent:
 
             if step % frame_stride == 0:
                 frames.append(env.render())  # tableau numpy RGB, gardé en mémoire seulement ici
+                frame_step_indices.append(step)
 
             # On catégorise grossièrement la "circonstance" pour le dashboard :
             # altitude (obs[1]) comme proxy simple de la phase de vol
@@ -156,7 +167,43 @@ class Agent:
                 phase = "approche"
             else:
                 phase = "atterrissage"
-            step_records.append({"phase": phase, "action": self._describe_action(action)})
+
+            # Action continue (PPO) : 2 floats -> colonnes séparées pour le
+            # graphique. Action discrète (DQN) : un entier -> sa propre colonne.
+            # Les deux représentations coexistent dans le record ; celle qui
+            # ne s'applique pas au modèle courant reste à None (filtrée côté GUI).
+            if isinstance(action, list):
+                action_main = float(action[0])
+                action_lateral = float(action[1]) if len(action) > 1 else None
+                action_discrete = None
+            else:
+                action_main = None
+                action_lateral = None
+                action_discrete = int(action)
+
+            # Espace d'observation LunarLander (8 dimensions), nommé pour
+            # être lisible dans les logs / le tableau / le graphique, plutôt
+            # que de laisser un vecteur brut opaque.
+            step_records.append({
+                "step": step,
+                "phase": phase,
+                "action": self._describe_action(action),
+                "action_raw": action,
+                "action_main": action_main,
+                "action_lateral": action_lateral,
+                "action_discrete": action_discrete,
+                "reward": float(reward),
+                "altitude": altitude,           # alias de obs_y, gardé pour compat avec /metrics/decisions historique
+                "observation": obs.tolist(),    # vecteur brut complet (8 floats), pour usages génériques
+                "obs_x": float(obs[0]),
+                "obs_y": float(obs[1]),
+                "obs_vx": float(obs[2]),
+                "obs_vy": float(obs[3]),
+                "obs_angle": float(obs[4]),
+                "obs_angular_velocity": float(obs[5]),
+                "obs_leg1_contact": float(obs[6]),
+                "obs_leg2_contact": float(obs[7]),
+            })
 
             obs = next_obs
             if terminated or truncated:
@@ -169,6 +216,7 @@ class Agent:
             "steps": step + 1,
             "actions": actions_taken,
             "frames": frames,          # liste de np.ndarray (H, W, 3)
+            "frame_step_indices": frame_step_indices,  # frames[i] <-> step_records[frame_step_indices[i]]
             "step_records": step_records,
         }
 
@@ -205,6 +253,7 @@ class Agent:
         max_attempts: int = 20,
         deterministic: bool = True,
         max_steps: int = 1000,
+        env_kwargs: dict | None = None,
     ) -> dict:
         """
         Rejoue des épisodes (frame_stride=1 : on garde TOUTES les frames,
@@ -224,7 +273,7 @@ class Agent:
         while len(successful) < num_episodes and attempts < max_attempts:
             attempts += 1
             result = self.run_episode(
-                deterministic=deterministic, max_steps=max_steps, frame_stride=1
+                deterministic=deterministic, max_steps=max_steps, frame_stride=1, env_kwargs=env_kwargs
             )
             all_attempt_rewards.append(result["total_reward"])
 

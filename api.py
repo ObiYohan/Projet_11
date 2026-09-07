@@ -14,8 +14,7 @@ Endpoints :
                                 une vidéo .mp4 persistante (dossier recordings/)
                                 — c'est l'endpoint pour le livrable "vidéo 20-30s"
 - GET  /metrics/summary      : stats agrégées (moyenne, écart-type, meilleur/pire score)
-- GET  /metrics/history      : historique épisode par épisode (pour la courbe de récompense)
-- GET  /metrics/decisions    : répartition des actions par "circonstance" (phase de vol)
+- GET  /metrics/timeline     : historique pas-à-pas (observation + action + récompense) de la dernière partie
 """
 
 import base64
@@ -68,6 +67,20 @@ def get_agent() -> Agent:
 # ------------------------------------------------------------------
 # Schémas de requête / réponse
 # ------------------------------------------------------------------
+class EnvConfig(BaseModel):
+    """
+    Paramètres physiques de LunarLander, modifiables depuis l'interface.
+    Les bornes reprennent celles imposées par gymnasium (gravity) ou
+    recommandées (wind_power, turbulence_power) — une valeur hors bornes
+    est rejetée avec une erreur 422 explicite avant même d'atteindre
+    l'environnement.
+    """
+    gravity: float = Field(-10.0, gt=-12.0, lt=0.0, description="Gravité (doit être entre -12 et 0, exclus)")
+    enable_wind: bool = Field(False, description="Active le vent (rafales aléatoires)")
+    wind_power: float = Field(15.0, ge=0.0, le=20.0, description="Intensité du vent (recommandé : 0-20)")
+    turbulence_power: float = Field(1.5, ge=0.0, le=2.0, description="Intensité de la turbulence (recommandé : 0-2)")
+
+
 class PlayRequest(BaseModel):
     state: list[float] = Field(..., description="État brut de l'environnement (ex: 8 floats pour LunarLander)")
     deterministic: bool = True
@@ -82,6 +95,7 @@ class SimulateRequest(BaseModel):
     max_steps: int = 1000
     frame_stride: int = Field(3, ge=1, description="1 frame conservée toutes les N, pour limiter la RAM")
     include_frames: bool = True
+    env_config: Optional[EnvConfig] = None
 
 
 class SimulateResponse(BaseModel):
@@ -90,6 +104,8 @@ class SimulateResponse(BaseModel):
     steps: int
     actions: list
     frames_base64: Optional[list[str]] = None  # images JPEG encodées, prêtes pour affichage GUI
+    frame_step_indices: list[int] = []  # frames_base64[i] <-> step_records[frame_step_indices[i]]
+    step_records: list = []  # historique pas-à-pas (step, phase, action, reward, altitude) pour le tableau des décisions
 
 
 class RecordDemoRequest(BaseModel):
@@ -98,6 +114,11 @@ class RecordDemoRequest(BaseModel):
     max_attempts: int = Field(20, ge=1, le=100, description="Nombre max de parties jouées avant d'abandonner")
     fps: int = Field(15, ge=5, le=60)
     deterministic: bool = True
+    env_config: Optional[EnvConfig] = None
+    overlay_signals: list[str] = Field(
+        default_factory=list,
+        description="Labels de signaux (clés de signals.SIGNAL_COLUMNS) à afficher en surimpression sur la vidéo. Vide = pas de surimpression.",
+    )
 
 
 class RecordDemoResponse(BaseModel):
@@ -148,6 +169,7 @@ def simulate(req: SimulateRequest):
         deterministic=req.deterministic,
         max_steps=req.max_steps,
         frame_stride=req.frame_stride,
+        env_kwargs=req.env_config.dict() if req.env_config else None,
     )
 
     episode_id = metrics_store.append_episode(
@@ -167,8 +189,8 @@ def simulate(req: SimulateRequest):
         # simultanément avant l'encodage
         frames_b64 = [_frame_to_base64_jpeg(f) for f in result["frames"]]
 
-    # on stocke aussi les step_records pour le endpoint /metrics/decisions
-    _last_decisions_holder["records"] = result["step_records"]
+    # on stocke aussi les step_records pour le endpoint /metrics/timeline
+    _last_episode_holder["records"] = result["step_records"]
 
     return SimulateResponse(
         episode_id=episode_id,
@@ -176,10 +198,12 @@ def simulate(req: SimulateRequest):
         steps=result["steps"],
         actions=result["actions"],
         frames_base64=frames_b64,
+        frame_step_indices=result["frame_step_indices"],
+        step_records=result["step_records"],
     )
 
 
-_last_decisions_holder: dict = {"records": []}
+_last_episode_holder: dict = {"records": []}
 
 
 @app.post("/record_demo", response_model=RecordDemoResponse)
@@ -202,6 +226,7 @@ def record_demo(req: RecordDemoRequest):
         reward_threshold=req.reward_threshold,
         max_attempts=req.max_attempts,
         deterministic=req.deterministic,
+        env_kwargs=req.env_config.model_dump() if req.env_config else None,
     )
 
     if not collected["episodes"]:
@@ -215,7 +240,9 @@ def record_demo(req: RecordDemoRequest):
             ),
         )
 
-    video_result = video_export.build_demo_video(collected["episodes"], fps=req.fps)
+    video_result = video_export.build_demo_video(
+        collected["episodes"], fps=req.fps, overlay_signals=req.overlay_signals
+    )
 
     return RecordDemoResponse(
         output_path=video_result["output_path"],
@@ -246,21 +273,15 @@ def metrics_history():
     }
 
 
-@app.get("/metrics/decisions")
-def metrics_decisions():
+@app.get("/metrics/timeline")
+def metrics_timeline():
     """
-    Répartition des actions prises par phase de vol, pour la dernière
-    partie simulée (voir agent.run_episode -> step_records).
+    Historique pas-à-pas COMPLET (observation + action + récompense) de la
+    dernière partie simulée (voir agent.run_episode -> step_records).
+    Alimente le graphique "actions vs observations dans le temps" du GUI :
+    contrairement à l'ancien /metrics/decisions (agrégation par phase), on
+    renvoie ici les données brutes, pour que le GUI puisse tracer n'importe
+    quel signal (récompense, une dimension de l'observation, une composante
+    de l'action) en fonction du temps, au choix de l'utilisateur.
     """
-    records = _last_decisions_holder.get("records", [])
-    if not records:
-        return {"phases": {}}
-
-    phases: dict = {}
-    for rec in records:
-        phase = rec["phase"]
-        action = str(rec["action"])
-        phases.setdefault(phase, {})
-        phases[phase][action] = phases[phase].get(action, 0) + 1
-
-    return {"phases": phases}
+    return {"step_records": _last_episode_holder.get("records", [])}

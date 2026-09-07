@@ -1,3 +1,43 @@
+"""
+app.py
+======
+Point d'entrée du Hugging Face Space.
+
+IMPORTANT (point de vigilance des consignes) : ce fichier ne contient
+AUCUNE logique RL. Il ne fait que :
+  1. monter l'application FastAPI (définie dans api.py) qui EXPOSE la logique,
+  2. construire une interface Gradio dont les callbacks appellent l'API
+     en HTTP (via `requests`), exactement comme le ferait n'importe quel
+     client externe.
+
+Cette séparation garantit que toute la logique RL reste testable et
+réutilisable indépendamment du frontend (on pourrait brancher un tout
+autre GUI sur la même API sans rien changer côté modèle).
+
+Exception assumée : la surimpression de métriques sur la vidéo d'aperçu
+("Voir une partie jouée") est dessinée ICI, via overlay.py. Ce n'est pas
+de la logique RL — c'est du rendu d'image pur à partir de données déjà
+calculées et déjà reçues de l'API (step_records) — au même titre que
+l'encodage de la vidéo elle-même, qui se fait déjà dans ce fichier. Pour
+la vidéo de démo PERSISTANTE (/record_demo), la surimpression est en
+revanche dessinée côté API (video_export.py), car cette vidéo est écrite
+entièrement côté serveur sans jamais transiter par le frontend.
+
+Architecture du Space (un seul process, un seul port) :
+    Ce Space est en sdk: gradio (pas Docker) : Hugging Face exécute
+    directement `python app.py`. C'est pour ça que ce fichier se termine
+    par un bloc `if __name__ == "__main__": uvicorn.run(...)` — c'est lui
+    qui démarre effectivement le serveur, sur le port attendu par HF Spaces
+    (variable d'environnement PORT, 7860 par défaut).
+
+    uvicorn sert `app` (FastAPI, avec Gradio monté dessus) sur ce port
+    -> les routes /play, /simulate, /metrics/* sont la logique RL (api.py)
+    -> la route "/" sert l'interface Gradio (montée ci-dessous), qui elle
+       même appelle http://127.0.0.1:{PORT}/... pour tout ce qu'elle affiche
+"""
+
+import base64
+import io
 import os
 import tempfile
 import time
@@ -6,8 +46,12 @@ import gradio as gr
 import numpy as np
 import pandas as pd
 import requests
+import imageio.v2 as imageio
+from PIL import Image
 
-from api import app as fastapi_app 
+from api import app as fastapi_app  # la logique RL vit ici, pas dans ce fichier
+from overlay import draw_metrics_overlay
+from signals import SIGNAL_COLUMNS
 
 # En interne, le GUI appelle l'API sur le même process (boucle locale).
 # PORT doit rester cohérent avec le port passé à uvicorn.run() en bas de ce fichier.
@@ -18,51 +62,34 @@ API_BASE_URL = os.environ.get("RL_API_BASE_URL", f"http://127.0.0.1:{PORT}")
 # ------------------------------------------------------------------
 # Callbacks GUI : "voir une partie jouée"
 # ------------------------------------------------------------------
-def play_episode(max_steps: int, frame_stride: int, progress=gr.Progress()):
+def _env_config_payload(gravity: float, enable_wind: bool, wind_power: float, turbulence_power: float) -> dict:
+    """Construit le payload env_config envoyé à l'API, partagé par tous les callbacks."""
+    return {
+        "gravity": float(gravity),
+        "enable_wind": bool(enable_wind),
+        "wind_power": float(wind_power),
+        "turbulence_power": float(turbulence_power),
+    }
+
+
+def play_episode_as_video(
+    max_steps: int,
+    frame_stride: int,
+    overlay_labels: list,
+    gravity: float,
+    enable_wind: bool,
+    wind_power: float,
+    turbulence_power: float,
+):
     """
-    Appelle POST /simulate et transforme les frames reçues en une liste
-    d'images pour gr.Gallery/gr.Image (Gradio gère l'animation via un
-    slider ou en jouant la galerie image par image).
-    """
-    progress(0, desc="Simulation en cours côté API...")
-    resp = requests.post(
-        f"{API_BASE_URL}/simulate",
-        json={
-            "deterministic": True,
-            "max_steps": int(max_steps),
-            "frame_stride": int(frame_stride),
-            "include_frames": True,
-        },
-        timeout=120,
-    )
-    resp.raise_for_status()
-    data = resp.json()
+    Construit un court fichier vidéo (mp4) à partir des frames reçues de
+    l'API, avec en option une surimpression des signaux choisis (dessinée
+    ici, voir la note en tête de fichier). Utilise imageio en générateur
+    d'écriture (pas de gros tableau numpy unique en mémoire) pour rester
+    léger en RAM.
 
-    # Décodage base64 -> images affichables. On le fait ici (frontend),
-    # pas de logique métier, juste de l'affichage.
-    import base64
-    import io
-    from PIL import Image
-
-    images = []
-    for b64 in data["frames_base64"]:
-        img = Image.open(io.BytesIO(base64.b64decode(b64)))
-        images.append(img)
-
-    summary = (
-        f"**Épisode #{data['episode_id']}** — "
-        f"Récompense totale : **{data['total_reward']:.2f}** — "
-        f"Durée : {data['steps']} pas"
-    )
-    return images, summary
-
-
-def play_episode_as_video(max_steps: int, frame_stride: int):
-    """
-    Variante : construit un court fichier vidéo (mp4) à partir des frames,
-    pour un rendu "animation d'atterrissage" plus fluide qu'une galerie.
-    Utilise imageio en générateur d'écriture (pas de gros tableau numpy
-    unique en mémoire) pour rester léger en RAM.
+    Renvoie aussi un tableau des décisions pas-à-pas (step_records reçus
+    de l'API), pour visualiser les actions prises au fil de l'épisode.
     """
     resp = requests.post(
         f"{API_BASE_URL}/simulate",
@@ -71,41 +98,72 @@ def play_episode_as_video(max_steps: int, frame_stride: int):
             "max_steps": int(max_steps),
             "frame_stride": int(frame_stride),
             "include_frames": True,
+            "env_config": _env_config_payload(gravity, enable_wind, wind_power, turbulence_power),
         },
         timeout=120,
     )
     resp.raise_for_status()
     data = resp.json()
 
-    import base64
-    import io
-
-    import imageio.v2 as imageio
-    from PIL import Image
+    frame_step_indices = data.get("frame_step_indices", [])
+    step_records = data.get("step_records", [])
 
     video_path = os.path.join(tempfile.gettempdir(), f"episode_{data['episode_id']}_{int(time.time())}.mp4")
     with imageio.get_writer(video_path, fps=15) as writer:
-        for b64 in data["frames_base64"]:
-            img = Image.open(io.BytesIO(base64.b64decode(b64)))
-            writer.append_data(np.array(img))  # écrite frame par frame, pas de buffer global
+        for i, b64 in enumerate(data["frames_base64"]):
+            img = np.array(Image.open(io.BytesIO(base64.b64decode(b64))))
+
+            if overlay_labels:
+                step_idx = frame_step_indices[i] if i < len(frame_step_indices) else None
+                record = step_records[step_idx] if step_idx is not None and step_idx < len(step_records) else None
+                if record is not None:
+                    img = draw_metrics_overlay(img, record, overlay_labels)
+
+            writer.append_data(img)  # écrite frame par frame, pas de buffer global
 
     summary = (
         f"**Épisode #{data['episode_id']}** — "
         f"Récompense totale : **{data['total_reward']:.2f}** — "
         f"Durée : {data['steps']} pas"
     )
-    return video_path, summary
+
+    # Tableau des décisions dans le temps : un pas = une ligne
+    decisions_df = pd.DataFrame(step_records)
+    if not decisions_df.empty:
+        decisions_df = decisions_df[["step", "phase", "action", "reward", "altitude"]].rename(
+            columns={
+                "step": "Pas",
+                "phase": "Phase",
+                "action": "Action",
+                "reward": "Récompense",
+                "altitude": "Altitude",
+            }
+        )
+
+    return video_path, summary, decisions_df
 
 
 # ------------------------------------------------------------------
 # Callback GUI : enregistrement de la vidéo de démo PERSISTANTE
 # (livrable "20-30s montrant une performance réussie")
 # ------------------------------------------------------------------
-def record_demo_video(num_episodes: int, reward_threshold: float, max_attempts: int, fps: int, progress=gr.Progress()):
+def record_demo_video(
+    num_episodes: int,
+    reward_threshold: float,
+    max_attempts: int,
+    fps: int,
+    overlay_labels: list,
+    gravity: float,
+    enable_wind: bool,
+    wind_power: float,
+    turbulence_power: float,
+    progress=gr.Progress(),
+):
     """
     Appelle POST /record_demo. Toute la logique (rejouer jusqu'à trouver
-    des parties réussies, écrire le .mp4 dans recordings/) est côté API :
-    ce callback ne fait qu'appeler l'endpoint et afficher le résultat.
+    des parties réussies, écrire le .mp4 dans recordings/, y compris la
+    surimpression des métriques) est côté API : ce callback ne fait
+    qu'appeler l'endpoint et afficher le résultat.
     """
     progress(0, desc="Génération en cours (peut prendre un moment selon le nombre de tentatives)...")
     resp = requests.post(
@@ -116,6 +174,8 @@ def record_demo_video(num_episodes: int, reward_threshold: float, max_attempts: 
             "max_attempts": int(max_attempts),
             "fps": int(fps),
             "deterministic": True,
+            "env_config": _env_config_payload(gravity, enable_wind, wind_power, turbulence_power),
+            "overlay_signals": overlay_labels or [],
         },
         timeout=600,  # peut nécessiter plusieurs tentatives, donc plus long que /simulate
     )
@@ -145,14 +205,48 @@ def record_demo_video(num_episodes: int, reward_threshold: float, max_attempts: 
 
 
 # ------------------------------------------------------------------
-# Callbacks Dashboard : métriques de performance
+# Callbacks Dashboard : actions vs observations dans le temps
 # ------------------------------------------------------------------
-def refresh_dashboard():
-    summary = requests.get(f"{API_BASE_URL}/metrics/summary", timeout=30).json()
-    history = requests.get(f"{API_BASE_URL}/metrics/history", timeout=30).json()
-    decisions = requests.get(f"{API_BASE_URL}/metrics/decisions", timeout=30).json()
+def _build_chart_df(raw_df: pd.DataFrame, selected_signals: list, normalize: bool) -> pd.DataFrame:
+    """
+    Construit le DataFrame long format (Pas, Valeur, Signal) attendu par le
+    LinePlot pour un ou plusieurs signaux choisis — une couleur par signal
+    (paramètre `color="Signal"` du LinePlot).
 
-    # ---- Résumé texte ----
+    normalize=True centre-réduit chaque signal indépendamment (z-score),
+    utile pour comparer des signaux d'échelles très différentes sur le même
+    graphique (ex : récompense ~[-100, 100] vs contact jambe ~[0, 1]).
+    """
+    if raw_df.empty or not selected_signals:
+        return pd.DataFrame({"Pas": [], "Valeur": [], "Signal": []})
+
+    frames = []
+    for label in selected_signals:
+        col = SIGNAL_COLUMNS.get(label)
+        if col is None or col not in raw_df.columns:
+            continue
+        values = raw_df[col].astype(float)
+        if normalize:
+            std = values.std()
+            values = (values - values.mean()) / std if std > 1e-9 else values * 0.0
+        frames.append(pd.DataFrame({"Pas": raw_df["step"], "Valeur": values, "Signal": label}))
+
+    if not frames:
+        return pd.DataFrame({"Pas": [], "Valeur": [], "Signal": []})
+    return pd.concat(frames, ignore_index=True)
+
+
+def refresh_dashboard(selected_signals: list, normalize: bool):
+    """
+    Récupère /metrics/summary (stats agrégées) et /metrics/timeline (données
+    pas-à-pas brutes de la dernière partie), puis construit le graphique
+    pour les signaux actuellement sélectionnés. La liste des signaux
+    proposés est recalculée à chaque rafraîchissement, pour ne montrer que
+    les colonnes réellement renseignées par le modèle chargé (discret vs continu).
+    """
+    summary = requests.get(f"{API_BASE_URL}/metrics/summary", timeout=30).json()
+    timeline = requests.get(f"{API_BASE_URL}/metrics/timeline", timeout=30).json()
+
     if summary["n_episodes"] == 0:
         summary_md = "Aucune partie jouée pour le moment. Cliquez sur *Jouer une partie* dans l'onglet GUI."
     else:
@@ -164,20 +258,30 @@ def refresh_dashboard():
             f"**Pire score :** {summary['worst']:.2f}"
         )
 
-    # ---- Courbe de récompense par épisode ----
-    if history["episodes"]:
-        reward_df = pd.DataFrame({"Épisode": history["episodes"], "Récompense": history["rewards"]})
-    else:
-        reward_df = pd.DataFrame({"Épisode": [], "Récompense": []})
+    records = timeline.get("step_records", [])
+    raw_df = pd.DataFrame(records) if records else pd.DataFrame()
 
-    # ---- Répartition des décisions par phase de vol (dernière partie) ----
-    rows = []
-    for phase, action_counts in decisions.get("phases", {}).items():
-        for action, count in action_counts.items():
-            rows.append({"Phase": phase, "Action": action, "Nombre": count})
-    decisions_df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["Phase", "Action", "Nombre"])
+    valid_options = [
+        label for label, col in SIGNAL_COLUMNS.items()
+        if col in raw_df.columns and raw_df[col].notna().any()
+    ] or ["Récompense"]
 
-    return summary_md, reward_df, decisions_df
+    selected_signals = [s for s in (selected_signals or []) if s in valid_options] or [valid_options[0]]
+
+    chart_df = _build_chart_df(raw_df, selected_signals, normalize)
+
+    return (
+        summary_md,
+        raw_df,
+        gr.update(choices=valid_options, value=selected_signals),
+        gr.update(value=chart_df),
+    )
+
+
+def update_timeline_chart(raw_df: pd.DataFrame, selected_signals: list, normalize: bool):
+    """Change juste les signaux affichés, à partir des données DÉJÀ chargées (pas de nouvel appel API)."""
+    chart_df = _build_chart_df(raw_df, selected_signals, normalize)
+    return gr.update(value=chart_df)
 
 
 # ------------------------------------------------------------------
@@ -190,18 +294,46 @@ with gr.Blocks(title="RL Agent — LunarLander") as demo:
         "(`/play`, `/simulate`, `/metrics/*`) : toute la logique RL est exécutée côté backend."
     )
 
+    # Paramètres d'environnement PARTAGÉS entre les onglets "Voir une partie
+    # jouée" et "Vidéo de démo" (mêmes composants Gradio référencés dans les
+    # deux callbacks .click() plus bas).
+    with gr.Accordion("⚙️ Paramètres de l'environnement (physique de LunarLander)", open=False):
+        gr.Markdown(
+            "Modifie la physique de l'environnement pour les prochaines parties jouées "
+            "(GUI et vidéo de démo). N'affecte pas `/play` (qui ne fait qu'une prédiction "
+            "sur un état déjà donné, sans environnement)."
+        )
+        with gr.Row():
+            gravity_input = gr.Slider(-11.9, -0.1, value=-10.0, step=0.1, label="Gravité (doit rester entre -12 et 0)")
+            enable_wind_input = gr.Checkbox(value=False, label="Activer le vent")
+        with gr.Row():
+            wind_power_input = gr.Slider(0.0, 20.0, value=15.0, step=0.5, label="Intensité du vent")
+            turbulence_power_input = gr.Slider(0.0, 2.0, value=1.5, step=0.1, label="Intensité de la turbulence")
+
+    env_config_inputs = [gravity_input, enable_wind_input, wind_power_input, turbulence_power_input]
+
     with gr.Tab("🎮 Voir une partie jouée"):
         with gr.Row():
             max_steps_input = gr.Slider(50, 1000, value=500, step=10, label="Nombre de pas maximum")
             frame_stride_input = gr.Slider(1, 10, value=3, step=1, label="1 frame gardée toutes les N (RAM)")
+        overlay_input = gr.Dropdown(
+            choices=list(SIGNAL_COLUMNS.keys()),
+            value=[],
+            multiselect=True,
+            label="Métriques en surimpression sur la vidéo (optionnel)",
+        )
         play_btn = gr.Button("▶️ Jouer une partie", variant="primary")
         episode_summary = gr.Markdown()
         episode_video = gr.Video(label="Animation de la partie")
+        decisions_table = gr.Dataframe(
+            label="Décisions dans le temps (une ligne = un pas de l'épisode)",
+            wrap=True,
+        )
 
         play_btn.click(
             fn=play_episode_as_video,
-            inputs=[max_steps_input, frame_stride_input],
-            outputs=[episode_video, episode_summary],
+            inputs=[max_steps_input, frame_stride_input, overlay_input, *env_config_inputs],
+            outputs=[episode_video, episode_summary, decisions_table],
         )
 
     with gr.Tab("🎬 Vidéo de démo (livrable)"):
@@ -223,34 +355,69 @@ with gr.Blocks(title="RL Agent — LunarLander") as demo:
         with gr.Row():
             max_attempts_input = gr.Slider(1, 100, value=20, step=1, label="Nombre max de tentatives")
             fps_input = gr.Slider(5, 30, value=15, step=1, label="Images par seconde de la vidéo")
+        overlay_demo_input = gr.Dropdown(
+            choices=list(SIGNAL_COLUMNS.keys()),
+            value=[],
+            multiselect=True,
+            label="Métriques en surimpression sur la vidéo (optionnel)",
+        )
         record_btn = gr.Button("🎥 Générer la vidéo de démo", variant="primary")
         record_summary = gr.Markdown()
         record_video = gr.Video(label="Vidéo de démo générée")
 
         record_btn.click(
             fn=record_demo_video,
-            inputs=[num_episodes_input, reward_threshold_input, max_attempts_input, fps_input],
+            inputs=[
+                num_episodes_input, reward_threshold_input, max_attempts_input, fps_input,
+                overlay_demo_input, *env_config_inputs,
+            ],
             outputs=[record_video, record_summary],
         )
 
     with gr.Tab("📊 Tableau de bord des performances"):
+        gr.Markdown(
+            "Visualise les réactions du modèle par rapport aux observations faites, "
+            "au fil du temps sur la dernière partie jouée : choisissez un ou plusieurs "
+            "signaux (récompense, une dimension de l'observation, une composante de "
+            "l'action) pour voir leur évolution pas à pas."
+        )
         refresh_btn = gr.Button("🔄 Rafraîchir")
         summary_md_out = gr.Markdown()
-        reward_plot = gr.LinePlot(
-            x="Épisode", y="Récompense", title="Récompense par épisode", height=300
-        )
-        decisions_plot = gr.BarPlot(
-            x="Phase", y="Nombre", color="Action",
-            title="Actions prises par phase de vol (dernière partie)", height=300
+        timeline_state = gr.State(pd.DataFrame())  # cache local des step_records déjà récupérés
+        with gr.Row():
+            signal_dropdown = gr.Dropdown(
+                choices=list(SIGNAL_COLUMNS.keys()),
+                value=["Récompense"],
+                multiselect=True,
+                label="Signaux à visualiser dans le temps",
+            )
+            normalize_checkbox = gr.Checkbox(
+                value=False,
+                label="Normaliser",
+            )
+        timeline_plot = gr.LinePlot(
+            x="Pas", y="Valeur", color="Signal", title="Signaux dans le temps (dernière partie)", height=350
         )
 
         refresh_btn.click(
             fn=refresh_dashboard,
-            outputs=[summary_md_out, reward_plot, decisions_plot],
+            inputs=[signal_dropdown, normalize_checkbox],
+            outputs=[summary_md_out, timeline_state, signal_dropdown, timeline_plot],
         )
         demo.load(
             fn=refresh_dashboard,
-            outputs=[summary_md_out, reward_plot, decisions_plot],
+            inputs=[signal_dropdown, normalize_checkbox],
+            outputs=[summary_md_out, timeline_state, signal_dropdown, timeline_plot],
+        )
+        signal_dropdown.change(
+            fn=update_timeline_chart,
+            inputs=[timeline_state, signal_dropdown, normalize_checkbox],
+            outputs=[timeline_plot],
+        )
+        normalize_checkbox.change(
+            fn=update_timeline_chart,
+            inputs=[timeline_state, signal_dropdown, normalize_checkbox],
+            outputs=[timeline_plot],
         )
 
     with gr.Tab("🔌 API"):
@@ -258,9 +425,9 @@ with gr.Blocks(title="RL Agent — LunarLander") as demo:
             "L'API FastAPI est servie sur ce même Space, sous les routes suivantes "
             "(documentation interactive : [/docs](/docs)) :\n\n"
             "- `POST /play` : `{\"state\": [...]}` -> `{\"action\": ...}`\n"
-            "- `POST /simulate` : joue un épisode complet côté serveur\n"
-            "- `POST /record_demo` : enchaîne des parties réussies et écrit une vidéo persistante (`recordings/`)\n"
-            "- `GET /metrics/summary`, `/metrics/history`, `/metrics/decisions`\n"
+            "- `POST /simulate` : joue un épisode complet côté serveur (accepte `env_config` : gravity, enable_wind, wind_power, turbulence_power)\n"
+            "- `POST /record_demo` : enchaîne des parties réussies et écrit une vidéo persistante (`recordings/`), avec `overlay_signals` optionnel\n"
+            "- `GET /metrics/summary`, `/metrics/timeline`\n"
         )
 
 # On monte Gradio SUR l'application FastAPI existante (celle qui contient
